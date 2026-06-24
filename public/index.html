@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🍹 Der Aperol Index</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+<link rel="stylesheet" href="styles.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>🍹 Der <span class="grad">Aperol Index</span></h1>
+  <p>Spritz-Preise im Verhältnis zur Luftlinie ans Meer</p>
+</header>
+
+<div class="wrap">
+  <div class="grid">
+    <!-- EINGABE -->
+    <div class="card">
+      <h2>➕ Neuer Eintrag</h2>
+      <label>Restaurant / Bar suchen</label>
+      <div class="search">
+        <input id="search" placeholder="Name + Ort, z.B. Essbar Port Andratx" autocomplete="off">
+        <div class="results" id="results"></div>
+      </div>
+      <div class="manual" style="margin-top:6px"><a id="placeLink">Nicht gefunden? Ort selbst auf der Karte antippen</a></div>
+      <label>Aperol-Preis (€)</label>
+      <input id="price" type="number" step="0.10" min="0" placeholder="8,50">
+      <div id="map"></div>
+      <div class="dist" id="dist">Noch kein Ort gewählt</div>
+      <div class="manual" id="manual" style="display:none">
+        Distanz stimmt nicht? <a id="manualLink">Meerpunkt manuell auf der Karte setzen</a>
+      </div>
+      <button class="addbtn" id="add" disabled>Eintrag speichern</button>
+      <p class="hint">Tippe den Namen (am besten mit Ort) → wähle den Treffer → die App findet automatisch Koordinaten und die nächste Küstenlinie und berechnet die kürzeste Luftlinie ans Meer. Treffer in deiner Nähe werden bevorzugt.</p>
+    </div>
+
+    <!-- DIAGRAMM -->
+    <div class="card">
+      <h2>📈 Preis vs. Meeresnähe</h2>
+      <canvas id="chart" height="300"></canvas>
+      <p class="hint" id="trendinfo">Sobald 2+ Einträge da sind, erscheint die Trendlinie: zeigt, ob Spritz näher am Meer wirklich teurer wird.</p>
+    </div>
+  </div>
+
+  <div class="stats" id="stats"></div>
+
+  <!-- TABELLE -->
+  <div class="card full">
+    <h2>🏆 Rangliste</h2>
+    <div class="toolbar">
+      <button class="tbtn" id="csv">⬇︎ CSV exportieren</button>
+      <button class="tbtn" id="reload">🔄 Aktualisieren</button>
+    </div>
+    <div style="overflow-x:auto;">
+    <table id="tbl">
+      <thead><tr>
+        <th data-k="name">Ort</th>
+        <th data-k="price" class="num">Preis €</th>
+        <th data-k="dist" class="num">Luftlinie Meer</th>
+        <th data-k="idx" class="num">€ pro 100 m</th>
+        <th data-k="resid">Bewertung</th>
+        <th></th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    </div>
+    <div class="status" id="status"></div>
+    <p class="hint"><b>€ pro 100 m</b> = Preis ÷ Meter zum Meer × 100 — je höher, desto mehr Strandzuschlag. <b>Bewertung</b> vergleicht den Preis mit der Trendlinie für diese Entfernung: 🟢 Schnäppchen, 🟠 fair, 🔴 Touri-Falle.</p>
+  </div>
+
+  <footer>Gemeinsame Liste über das Backend · Suche & Küste via OpenStreetMap (Photon/Nominatim/Overpass).</footer>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

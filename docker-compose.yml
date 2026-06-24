@@ -1,0 +1,19 @@
+services:
+  aperol:
+    build: .
+    container_name: aperol-index
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"   # nur lokal – Zugriff von außen läuft über nginx
+    volumes:
+      - aperol-data:/app/data
+    environment:
+      - PORT=3000
+      - DB_PATH=/app/data/aperol.db
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}   # optional: aus .env geladen; leer = OSM-Suche
+    env_file:
+      - path: .env
+        required: false
+
+volumes:
+  aperol-data:
