@@ -7,6 +7,9 @@ import rateLimit from 'express-rate-limit';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
+// Hinter genau einem Reverse-Proxy (nginx): X-Forwarded-For vertrauen,
+// damit express-rate-limit die echte Client-IP nutzt.
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 const UA = 'AperolIndex/1.0 (kian.brunke@gmx.de)'; // nur für Overpass (Küstenlinie)
 const GOOGLE_API_KEY  = process.env.GOOGLE_API_KEY  || ''; // Places API (Suche)
