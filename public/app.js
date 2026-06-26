@@ -12,6 +12,10 @@ async function authFetch(url, options = {}) {
     location.reload();
     throw new Error('auth');
   }
+  if (res.status === 503) {
+    location.reload(); // Kontingent erreicht → Server liefert die Sperr-Seite
+    throw new Error('auth');
+  }
   return res;
 }
 
@@ -244,6 +248,7 @@ async function doSearch(q) {
     let url = '/api/search?q=' + encodeURIComponent(q);
     if (userLoc) url += '&lat=' + userLoc.lat + '&lng=' + userLoc.lng;
     const res = await authFetch(url);
+    if (res.status === 501) { showResultsInfo('Suche nicht konfiguriert — GOOGLE_API_KEY fehlt'); return; }
     if (!res.ok) throw new Error('search ' + res.status);
     const results = await res.json();
     lastResults = results; hlIdx = -1;
@@ -469,7 +474,11 @@ document.getElementById('csv').onclick = () => {
 // ---- Init ----
 async function init() {
   let config = { auth: false, mapsKey: '' };
-  try { config = await fetch('/api/config').then(r => r.json()); } catch (_e) {}
+  try {
+    const cfgRes = await fetch('/api/config');
+    if (cfgRes.status === 503) { location.reload(); return; } // Kontingent erreicht
+    config = await cfgRes.json();
+  } catch (_e) {}
 
   // Auth
   if (config.auth) {
