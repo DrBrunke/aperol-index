@@ -205,10 +205,12 @@ app.post('/api/auth/register/verify', async (req, res) => {
 // Schritt 1 Login: Authentifizierungs-Optionen (discoverable credentials).
 app.post('/api/auth/login/options', async (_req, res) => {
   if (!authEnabled()) return res.status(400).json({ error: 'Zugangsschutz ist deaktiviert' });
+  // Alle bekannten Geräte als erlaubte Credentials mitgeben. So findet der Browser
+  // den Passkey auch dann, wenn er nicht "discoverable" gespeichert wurde.
   const options = await generateAuthenticationOptions({
     rpID: RP_ID,
     userVerification: 'preferred',
-    allowCredentials: [], // leer = Platform wählt passenden Passkey selbst
+    allowCredentials: listCredentials().map((c) => ({ id: c.id, transports: c.transports })),
   });
   setCookie(res, 'aperol_chal', putChallenge(options.challenge), 300);
   res.json(options);
