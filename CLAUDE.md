@@ -75,8 +75,9 @@ ein vom Client mitgeschicktes `dist` wird ignoriert.
 ## Env-Variablen
 
 `PORT` (3000) · `DB_PATH` (`./data/aperol.db`) ·
-`REGISTER_CODE` (Einmal-Code; leer = kein Zugangsschutz) · `RP_ID` (Domain ohne Protokoll, Default `localhost`) ·
-`RP_ORIGIN` (volle Origin inkl. Protokoll, Default `http://localhost:PORT`) · `RP_NAME` (`Aperol Index`) ·
+`REGISTER_CODE` (Einmal-Code; leer = kein Zugangsschutz) ·
+`RP_ORIGIN` (volle Origin inkl. Protokoll, Trailing-Slash wird entfernt, Default `http://localhost:PORT`) ·
+`RP_ID` (Domain ohne Protokoll; wenn leer automatisch aus `RP_ORIGIN`-Hostname abgeleitet) · `RP_NAME` (`Aperol Index`) ·
 `SESSION_TTL_DAYS` (365) · `GOOGLE_MAPS_KEY` · `GOOGLE_API_KEY` · `GOOGLE_MONTHLY_LIMIT` (9000).
 Vorlage: `.env.example`. `.env` ist gitignored. Google-Keys einschränken: Maps-Key auf HTTP-Referrer, Places-Key auf VPS-IP.
 **Wichtig hinter nginx:** `RP_ID`/`RP_ORIGIN` auf die echte HTTPS-Domain setzen, sonst lehnt der Browser FaceID ab.

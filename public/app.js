@@ -43,7 +43,10 @@ async function doRegister() {
     const attResp = await SWA.startRegistration({ optionsJSON });
     const verRes = await postJSON('/api/auth/register/verify', { response: attResp, label });
     const j = await verRes.json().catch(() => ({}));
-    if (!verRes.ok || !j.verified) { setAuthError('Einrichtung fehlgeschlagen.'); return false; }
+    if (!verRes.ok || !j.verified) {
+      setAuthError('Einrichtung fehlgeschlagen.' + (j.error ? ' (' + j.error + (j.detail ? ': ' + j.detail : '') + ')' : ''));
+      return false;
+    }
     return true;
   } catch (e) {
     if (e.name === 'NotAllowedError' || e.name === 'AbortError') setAuthError('Vorgang abgebrochen.');
@@ -62,7 +65,10 @@ async function doLogin() {
     const asseResp = await SWA.startAuthentication({ optionsJSON });
     const verRes = await postJSON('/api/auth/login/verify', { response: asseResp });
     const j = await verRes.json().catch(() => ({}));
-    if (!verRes.ok || !j.verified) { setAuthError('Anmeldung fehlgeschlagen.'); return false; }
+    if (!verRes.ok || !j.verified) {
+      setAuthError('Anmeldung fehlgeschlagen.' + (j.error ? ' (' + j.error + (j.detail ? ': ' + j.detail : '') + ')' : ''));
+      return false;
+    }
     return true;
   } catch (e) {
     if (e.name === 'NotAllowedError' || e.name === 'AbortError') setAuthError('Vorgang abgebrochen.');

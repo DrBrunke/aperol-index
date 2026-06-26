@@ -29,11 +29,15 @@ const GOOGLE_MAPS_KEY = process.env.GOOGLE_MAPS_KEY || ''; // Maps JS API (Karte
 // FaceID/Passkey eingegeben werden muss. Leer = Zugangsschutz komplett deaktiviert.
 const REGISTER_CODE = process.env.REGISTER_CODE || '';
 const RP_NAME   = process.env.RP_NAME   || 'Aperol Index';
-// RP_ID = registrierbare Domain (ohne Protokoll/Port), z.B. aperol.example.com.
-// Muss zur aufrufenden Domain passen, sonst lehnt der Browser WebAuthn ab.
-const RP_ID     = process.env.RP_ID     || 'localhost';
 // RP_ORIGIN = vollständige Origin inkl. Protokoll, z.B. https://aperol.example.com.
-const RP_ORIGIN = process.env.RP_ORIGIN || `http://localhost:${PORT}`;
+// Trailing-Slashes entfernen, da die WebAuthn-Verifizierung die Origin ZEICHENGENAU
+// vergleicht (https://x.de/ ≠ https://x.de).
+const RP_ORIGIN = (process.env.RP_ORIGIN || `http://localhost:${PORT}`).replace(/\/+$/, '');
+// RP_ID = registrierbare Domain (ohne Protokoll/Port), z.B. aperol.example.com.
+// Wenn nicht gesetzt, automatisch aus RP_ORIGIN ableiten (Hostname), damit ein
+// gesetztes RP_ORIGIN allein schon korrekt funktioniert.
+let RP_ID = process.env.RP_ID || '';
+try { if (!RP_ID) RP_ID = new URL(RP_ORIGIN).hostname; } catch { RP_ID = 'localhost'; }
 // "Angemeldet bleiben": Session-Lebensdauer in Tagen.
 const SESSION_TTL_DAYS = parseInt(process.env.SESSION_TTL_DAYS || '365', 10);
 // Stabiler User-Handle: die App teilt EINE Liste, alle Passkeys gehören zu diesem Nutzer.
@@ -184,7 +188,10 @@ app.post('/api/auth/register/verify', async (req, res) => {
   if (!authEnabled()) return res.status(400).json({ error: 'Zugangsschutz ist deaktiviert' });
   const expectedChallenge = takeChallenge(parseCookies(req).aperol_chal);
   clearCookie(res, 'aperol_chal');
-  if (!expectedChallenge) return res.status(400).json({ error: 'Challenge abgelaufen' });
+  if (!expectedChallenge) {
+    console.error('[auth] register/verify: keine/abgelaufene Challenge (Cookie aperol_chal fehlt?)');
+    return res.status(400).json({ error: 'Challenge abgelaufen' });
+  }
   try {
     const { verified, registrationInfo } = await verifyRegistrationResponse({
       response: req.body?.response,
@@ -192,13 +199,17 @@ app.post('/api/auth/register/verify', async (req, res) => {
       expectedOrigin: RP_ORIGIN,
       expectedRPID: RP_ID,
     });
-    if (!verified || !registrationInfo) return res.status(400).json({ error: 'Verifizierung fehlgeschlagen' });
+    if (!verified || !registrationInfo) {
+      console.error('[auth] register/verify: nicht verifiziert', { verified, hasInfo: !!registrationInfo });
+      return res.status(400).json({ error: 'Verifizierung fehlgeschlagen' });
+    }
     const { id, publicKey, counter, transports } = registrationInfo.credential;
     addCredential({ id, publicKey, counter, transports, label: (req.body?.label || '').toString().slice(0, 60) });
     startSession(res, id);
     res.json({ verified: true });
   } catch (e) {
-    res.status(400).json({ error: 'Verifizierung fehlgeschlagen' });
+    console.error('[auth] register/verify Fehler:', e?.message, '\n  erwartete Origin:', RP_ORIGIN, '| RP_ID:', RP_ID);
+    res.status(400).json({ error: 'Verifizierung fehlgeschlagen', detail: e?.message });
   }
 });
 
@@ -221,9 +232,15 @@ app.post('/api/auth/login/verify', async (req, res) => {
   if (!authEnabled()) return res.status(400).json({ error: 'Zugangsschutz ist deaktiviert' });
   const expectedChallenge = takeChallenge(parseCookies(req).aperol_chal);
   clearCookie(res, 'aperol_chal');
-  if (!expectedChallenge) return res.status(400).json({ error: 'Challenge abgelaufen' });
+  if (!expectedChallenge) {
+    console.error('[auth] login/verify: keine/abgelaufene Challenge (Cookie aperol_chal fehlt?)');
+    return res.status(400).json({ error: 'Challenge abgelaufen' });
+  }
   const cred = getCredential(req.body?.response?.id);
-  if (!cred) return res.status(400).json({ error: 'Unbekanntes Gerät' });
+  if (!cred) {
+    console.error('[auth] login/verify: unbekanntes Gerät, id=', req.body?.response?.id);
+    return res.status(400).json({ error: 'Unbekanntes Gerät' });
+  }
   try {
     const { verified, authenticationInfo } = await verifyAuthenticationResponse({
       response: req.body?.response,
@@ -232,12 +249,16 @@ app.post('/api/auth/login/verify', async (req, res) => {
       expectedRPID: RP_ID,
       credential: { id: cred.id, publicKey: cred.publicKey, counter: cred.counter, transports: cred.transports },
     });
-    if (!verified) return res.status(400).json({ error: 'Verifizierung fehlgeschlagen' });
+    if (!verified) {
+      console.error('[auth] login/verify: nicht verifiziert');
+      return res.status(400).json({ error: 'Verifizierung fehlgeschlagen' });
+    }
     updateCredentialCounter(cred.id, authenticationInfo.newCounter);
     startSession(res, cred.id);
     res.json({ verified: true });
   } catch (e) {
-    res.status(400).json({ error: 'Verifizierung fehlgeschlagen' });
+    console.error('[auth] login/verify Fehler:', e?.message, '\n  erwartete Origin:', RP_ORIGIN, '| RP_ID:', RP_ID);
+    res.status(400).json({ error: 'Verifizierung fehlgeschlagen', detail: e?.message });
   }
 });
 
