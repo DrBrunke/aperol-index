@@ -25,6 +25,25 @@ db.exec(`
     month TEXT    PRIMARY KEY,        -- 'YYYY-MM'
     count INTEGER NOT NULL DEFAULT 0
   );
+
+  -- WebAuthn/Passkey-Zugangsdaten. Jeder Datensatz = ein freigeschaltetes Gerät
+  -- (FaceID/TouchID). id ist die Credential-ID (base64url), public_key der COSE-Key.
+  CREATE TABLE IF NOT EXISTS credentials (
+    id          TEXT    PRIMARY KEY,
+    public_key  BLOB    NOT NULL,
+    counter     INTEGER NOT NULL DEFAULT 0,
+    transports  TEXT,                  -- JSON-Array, z.B. ["internal"]
+    label       TEXT,                  -- Gerätename, vom Nutzer vergeben
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- "Angemeldet bleiben": langlebige Sessions (Cookie-Token → Ablaufdatum).
+  CREATE TABLE IF NOT EXISTS sessions (
+    token         TEXT    PRIMARY KEY,
+    credential_id TEXT,
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+    expires_at    TEXT    NOT NULL
+  );
 `);
 
 const rowToEntry = (r) => ({
@@ -68,4 +87,62 @@ export function bumpUsage(n = 1) {
     ON CONFLICT(month) DO UPDATE SET count = count + ?
   `).run(m, n, n);
   return getMonthlyUsage();
+}
+
+// ---------- WebAuthn-Credentials ----------
+export function listCredentials() {
+  return db.prepare('SELECT * FROM credentials ORDER BY created_at').all().map((r) => ({
+    id: r.id,
+    publicKey: r.public_key,                       // Buffer (BLOB)
+    counter: r.counter,
+    transports: r.transports ? JSON.parse(r.transports) : undefined,
+    label: r.label,
+  }));
+}
+
+export function getCredential(id) {
+  const r = db.prepare('SELECT * FROM credentials WHERE id = ?').get(id);
+  if (!r) return null;
+  return {
+    id: r.id,
+    publicKey: r.public_key,
+    counter: r.counter,
+    transports: r.transports ? JSON.parse(r.transports) : undefined,
+    label: r.label,
+  };
+}
+
+export function hasCredentials() {
+  return db.prepare('SELECT COUNT(*) AS n FROM credentials').get().n > 0;
+}
+
+export function addCredential({ id, publicKey, counter, transports, label }) {
+  db.prepare(`
+    INSERT INTO credentials (id, public_key, counter, transports, label)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(id, Buffer.from(publicKey), counter, transports ? JSON.stringify(transports) : null, label || null);
+}
+
+export function updateCredentialCounter(id, counter) {
+  db.prepare('UPDATE credentials SET counter = ? WHERE id = ?').run(counter, id);
+}
+
+// ---------- Sessions ("angemeldet bleiben") ----------
+export function createSession(token, credentialId, expiresAt) {
+  db.prepare('INSERT INTO sessions (token, credential_id, expires_at) VALUES (?, ?, ?)')
+    .run(token, credentialId || null, expiresAt);
+}
+
+export function getSession(token) {
+  const r = db.prepare("SELECT * FROM sessions WHERE token = ? AND expires_at > datetime('now')").get(token);
+  return r || null;
+}
+
+export function deleteSession(token) {
+  db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+}
+
+// Aufräumen abgelaufener Sessions (gelegentlich beim Start/Verifizieren aufrufen).
+export function purgeExpiredSessions() {
+  db.prepare("DELETE FROM sessions WHERE expires_at <= datetime('now')").run();
 }

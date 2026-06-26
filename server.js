@@ -1,9 +1,18 @@
 import express from 'express';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { listEntries, addEntry, deleteEntry, getMonthlyUsage, bumpUsage } from './db.js';
-import { nearestCoastPoint } from './geo.js';
+import { randomBytes } from 'node:crypto';
+import {
+  listEntries, addEntry, deleteEntry, getMonthlyUsage, bumpUsage,
+  listCredentials, getCredential, hasCredentials, addCredential,
+  updateCredentialCounter, createSession, getSession, deleteSession, purgeExpiredSessions,
+} from './db.js';
+import { nearestCoastPoint, haversine } from './geo.js';
 import rateLimit from 'express-rate-limit';
+import {
+  generateRegistrationOptions, verifyRegistrationResponse,
+  generateAuthenticationOptions, verifyAuthenticationResponse,
+} from '@simplewebauthn/server';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -14,10 +23,29 @@ const PORT = process.env.PORT || 3000;
 const UA = 'AperolIndex/1.0 (kian.brunke@gmx.de)'; // nur für Overpass (Küstenlinie)
 const GOOGLE_API_KEY  = process.env.GOOGLE_API_KEY  || ''; // Places API (Suche)
 const GOOGLE_MAPS_KEY = process.env.GOOGLE_MAPS_KEY || ''; // Maps JS API (Karte)
-const AUTH_TOKEN      = process.env.AUTH_TOKEN      || '';
+
+// ---------- WebAuthn / FaceID-Zugang ----------
+// REGISTER_CODE: Einmal-Code, der EINMAL pro neuem Gerät beim Einrichten der
+// FaceID/Passkey eingegeben werden muss. Leer = Zugangsschutz komplett deaktiviert.
+const REGISTER_CODE = process.env.REGISTER_CODE || '';
+const RP_NAME   = process.env.RP_NAME   || 'Aperol Index';
+// RP_ID = registrierbare Domain (ohne Protokoll/Port), z.B. aperol.example.com.
+// Muss zur aufrufenden Domain passen, sonst lehnt der Browser WebAuthn ab.
+const RP_ID     = process.env.RP_ID     || 'localhost';
+// RP_ORIGIN = vollständige Origin inkl. Protokoll, z.B. https://aperol.example.com.
+const RP_ORIGIN = process.env.RP_ORIGIN || `http://localhost:${PORT}`;
+// "Angemeldet bleiben": Session-Lebensdauer in Tagen.
+const SESSION_TTL_DAYS = parseInt(process.env.SESSION_TTL_DAYS || '365', 10);
+// Stabiler User-Handle: die App teilt EINE Liste, alle Passkeys gehören zu diesem Nutzer.
+const USER_HANDLE = new TextEncoder().encode('aperol-user');
+
+const authEnabled = () => !!REGISTER_CODE;
+
 // Kostenschutz: max. billbare Google-Aufrufe (Karte + Suche) pro Kalendermonat.
 // Bei Erreichen wird die KOMPLETTE App bis zum Monatsersten gesperrt. 0 = unbegrenzt.
 const GOOGLE_MONTHLY_LIMIT = parseInt(process.env.GOOGLE_MONTHLY_LIMIT || '9000', 10);
+
+purgeExpiredSessions();
 
 app.use(express.json());
 
@@ -66,12 +94,157 @@ app.use((req, res, next) => {
 
 app.use(express.static(join(__dirname, 'public')));
 
+// ---------- Cookies (ohne Extra-Dependency) ----------
+const SECURE_COOKIES = RP_ORIGIN.startsWith('https');
+function parseCookies(req) {
+  const out = {};
+  (req.headers.cookie || '').split(';').forEach((part) => {
+    const i = part.indexOf('=');
+    if (i > -1) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  });
+  return out;
+}
+function setCookie(res, name, value, maxAgeSec) {
+  let c = `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax`;
+  if (SECURE_COOKIES) c += '; Secure';
+  if (maxAgeSec != null) c += `; Max-Age=${maxAgeSec}`;
+  res.append('Set-Cookie', c);
+}
+function clearCookie(res, name) {
+  let c = `${name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+  if (SECURE_COOKIES) c += '; Secure';
+  res.append('Set-Cookie', c);
+}
+
+// ---------- Challenge-Store (in-memory, kurzlebig) ----------
+// Hält die WebAuthn-Challenge serverseitig, referenziert über ein kurzlebiges Cookie.
+const challenges = new Map();
+function putChallenge(challenge) {
+  const id = randomBytes(18).toString('base64url');
+  challenges.set(id, { challenge, exp: Date.now() + 5 * 60_000 });
+  return id;
+}
+function takeChallenge(id) {
+  const e = id && challenges.get(id);
+  if (e) challenges.delete(id);
+  if (!e || e.exp < Date.now()) return null;
+  return e.challenge;
+}
+
+// ---------- Sessions ----------
+function startSession(res, credentialId) {
+  const token = randomBytes(32).toString('base64url');
+  const expires = new Date(Date.now() + SESSION_TTL_DAYS * 86400_000);
+  // SQLite-Format 'YYYY-MM-DD HH:MM:SS' (UTC) für datetime()-Vergleiche.
+  createSession(token, credentialId, expires.toISOString().slice(0, 19).replace('T', ' '));
+  setCookie(res, 'aperol_session', token, SESSION_TTL_DAYS * 86400);
+}
+
 // ---------- Auth ----------
 function requireAuth(req, res, next) {
-  if (!AUTH_TOKEN) return next();
-  if ((req.headers['authorization'] || '') === 'Bearer ' + AUTH_TOKEN) return next();
+  if (!authEnabled()) return next();
+  const token = parseCookies(req).aperol_session;
+  if (token && getSession(token)) return next();
   res.status(401).json({ error: 'Nicht autorisiert' });
 }
+
+// ---------- Auth-Routen (WebAuthn / FaceID) ----------
+app.get('/api/auth/status', (req, res) => {
+  const token = parseCookies(req).aperol_session;
+  res.json({
+    enabled: authEnabled(),
+    authed: !authEnabled() || !!(token && getSession(token)),
+    hasCredentials: hasCredentials(),
+  });
+});
+
+// Schritt 1 Registrierung: Optionen anfordern (Einmal-Code erforderlich).
+app.post('/api/auth/register/options', async (req, res) => {
+  if (!authEnabled()) return res.status(400).json({ error: 'Zugangsschutz ist deaktiviert' });
+  if ((req.body?.code || '') !== REGISTER_CODE) return res.status(403).json({ error: 'Falscher Code' });
+  const options = await generateRegistrationOptions({
+    rpName: RP_NAME,
+    rpID: RP_ID,
+    userID: USER_HANDLE,
+    userName: 'Aperol Index',
+    attestationType: 'none',
+    excludeCredentials: listCredentials().map((c) => ({ id: c.id, transports: c.transports })),
+    authenticatorSelection: {
+      residentKey: 'preferred',
+      userVerification: 'preferred',
+      authenticatorAttachment: 'platform', // FaceID/TouchID des Geräts
+    },
+  });
+  setCookie(res, 'aperol_chal', putChallenge(options.challenge), 300);
+  res.json(options);
+});
+
+// Schritt 2 Registrierung: Antwort des Authenticators verifizieren + Gerät speichern.
+app.post('/api/auth/register/verify', async (req, res) => {
+  if (!authEnabled()) return res.status(400).json({ error: 'Zugangsschutz ist deaktiviert' });
+  const expectedChallenge = takeChallenge(parseCookies(req).aperol_chal);
+  clearCookie(res, 'aperol_chal');
+  if (!expectedChallenge) return res.status(400).json({ error: 'Challenge abgelaufen' });
+  try {
+    const { verified, registrationInfo } = await verifyRegistrationResponse({
+      response: req.body?.response,
+      expectedChallenge,
+      expectedOrigin: RP_ORIGIN,
+      expectedRPID: RP_ID,
+    });
+    if (!verified || !registrationInfo) return res.status(400).json({ error: 'Verifizierung fehlgeschlagen' });
+    const { id, publicKey, counter, transports } = registrationInfo.credential;
+    addCredential({ id, publicKey, counter, transports, label: (req.body?.label || '').toString().slice(0, 60) });
+    startSession(res, id);
+    res.json({ verified: true });
+  } catch (e) {
+    res.status(400).json({ error: 'Verifizierung fehlgeschlagen' });
+  }
+});
+
+// Schritt 1 Login: Authentifizierungs-Optionen (discoverable credentials).
+app.post('/api/auth/login/options', async (_req, res) => {
+  if (!authEnabled()) return res.status(400).json({ error: 'Zugangsschutz ist deaktiviert' });
+  const options = await generateAuthenticationOptions({
+    rpID: RP_ID,
+    userVerification: 'preferred',
+    allowCredentials: [], // leer = Platform wählt passenden Passkey selbst
+  });
+  setCookie(res, 'aperol_chal', putChallenge(options.challenge), 300);
+  res.json(options);
+});
+
+// Schritt 2 Login: Assertion verifizieren + Session starten.
+app.post('/api/auth/login/verify', async (req, res) => {
+  if (!authEnabled()) return res.status(400).json({ error: 'Zugangsschutz ist deaktiviert' });
+  const expectedChallenge = takeChallenge(parseCookies(req).aperol_chal);
+  clearCookie(res, 'aperol_chal');
+  if (!expectedChallenge) return res.status(400).json({ error: 'Challenge abgelaufen' });
+  const cred = getCredential(req.body?.response?.id);
+  if (!cred) return res.status(400).json({ error: 'Unbekanntes Gerät' });
+  try {
+    const { verified, authenticationInfo } = await verifyAuthenticationResponse({
+      response: req.body?.response,
+      expectedChallenge,
+      expectedOrigin: RP_ORIGIN,
+      expectedRPID: RP_ID,
+      credential: { id: cred.id, publicKey: cred.publicKey, counter: cred.counter, transports: cred.transports },
+    });
+    if (!verified) return res.status(400).json({ error: 'Verifizierung fehlgeschlagen' });
+    updateCredentialCounter(cred.id, authenticationInfo.newCounter);
+    startSession(res, cred.id);
+    res.json({ verified: true });
+  } catch (e) {
+    res.status(400).json({ error: 'Verifizierung fehlgeschlagen' });
+  }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  const token = parseCookies(req).aperol_session;
+  if (token) deleteSession(token);
+  clearCookie(res, 'aperol_session');
+  res.json({ ok: true });
+});
 
 // ---------- Rate Limiting ----------
 const searchLimiter = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false });
@@ -81,7 +254,7 @@ const coastLimiter  = rateLimit({ windowMs: 60_000, max: 20, standardHeaders: tr
 // Jeder Aufruf = eine Map-JS-Ladung im Browser → zählt als billbarer Google-Aufruf.
 app.get('/api/config', (_req, res) => {
   if (GOOGLE_MAPS_KEY) bumpUsage(1);
-  res.json({ auth: !!AUTH_TOKEN, mapsKey: GOOGLE_MAPS_KEY });
+  res.json({ auth: authEnabled(), mapsKey: GOOGLE_MAPS_KEY });
 });
 
 // ---------- Einträge (geteilte Liste) ----------
@@ -93,11 +266,14 @@ app.post('/api/entries', requireAuth, (req, res) => {
   const b = req.body || {};
   const ok = b.name &&
              typeof b.price === 'number' && b.price > 0 &&
-             typeof b.dist  === 'number' && b.dist  > 0 &&
              b.r && b.s &&
              [b.r.lat, b.r.lng, b.s.lat, b.s.lng].every(n => typeof n === 'number');
   if (!ok) return res.status(400).json({ error: 'Ungültige Daten' });
-  res.status(201).json(addEntry(b));
+  // dist immer serverseitig aus den Koordinaten berechnen – ein vom Client
+  // mitgeschicktes dist wird ignoriert (verhindert inkonsistente Werte).
+  const dist = haversine(b.r, b.s);
+  if (!(dist > 0)) return res.status(400).json({ error: 'Ungültige Daten' });
+  res.status(201).json(addEntry({ ...b, dist }));
 });
 
 app.delete('/api/entries/:id', requireAuth, (req, res) => {

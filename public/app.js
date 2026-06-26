@@ -1,58 +1,102 @@
-// ---- Auth ----
-let sessionToken = '';
+// ---- Konstanten ----
+// Aperol unter diesem Preis (€) gilt immer als Schnäppchen — egal wie weit weg vom Meer.
+const ABSOLUTE_DEAL_PRICE = 6;
+
+// ---- Auth (WebAuthn / FaceID) ----
+// Die Anmeldung läuft über einen sicheren HttpOnly-Session-Cookie, den der Server
+// setzt. Der Browser sendet ihn bei same-origin-Requests automatisch mit — daher
+// kein Token im JS nötig ("angemeldet bleiben" steckt im Cookie).
+const SWA = window.SimpleWebAuthnBrowser;
 
 async function authFetch(url, options = {}) {
-  if (sessionToken) {
-    options = { ...options, headers: { ...(options.headers || {}), 'Authorization': 'Bearer ' + sessionToken } };
-  }
   const res = await fetch(url, options);
-  if (res.status === 401) {
-    sessionToken = '';
-    sessionStorage.removeItem('aperol_token');
-    location.reload();
-    throw new Error('auth');
-  }
-  if (res.status === 503) {
-    location.reload(); // Kontingent erreicht → Server liefert die Sperr-Seite
-    throw new Error('auth');
-  }
+  if (res.status === 401) { location.reload(); throw new Error('auth'); }      // Session abgelaufen
+  if (res.status === 503) { location.reload(); throw new Error('auth'); }      // Kontingent erreicht
   return res;
 }
 
-function showAuthOverlay(wrongPin = false) {
-  document.getElementById('auth-overlay').style.display = 'flex';
-  document.getElementById('pin-error').style.display = wrongPin ? 'block' : 'none';
-  document.getElementById('pin-input').value = '';
-  setTimeout(() => document.getElementById('pin-input').focus(), 50);
+function setAuthError(msg) {
+  const e = document.getElementById('auth-error');
+  e.textContent = msg || '';
+  e.style.display = msg ? 'block' : 'none';
 }
 
-function hideAuthOverlay() {
-  document.getElementById('auth-overlay').style.display = 'none';
+async function postJSON(url, body) {
+  return fetch(url, {
+    method: 'POST',
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
 }
 
-async function waitForAuth() {
-  showAuthOverlay();
+// Neues Gerät freischalten: Einmal-Code + FaceID-Einrichtung.
+async function doRegister() {
+  setAuthError('');
+  const code = document.getElementById('reg-code').value.trim();
+  const label = document.getElementById('reg-label').value.trim();
+  if (!code) { setAuthError('Bitte den Einmal-Code eingeben.'); return false; }
+  try {
+    const optRes = await postJSON('/api/auth/register/options', { code, label });
+    if (optRes.status === 403) { setAuthError('Falscher Einmal-Code.'); return false; }
+    if (!optRes.ok) throw new Error('options');
+    const optionsJSON = await optRes.json();
+    const attResp = await SWA.startRegistration({ optionsJSON });
+    const verRes = await postJSON('/api/auth/register/verify', { response: attResp, label });
+    const j = await verRes.json().catch(() => ({}));
+    if (!verRes.ok || !j.verified) { setAuthError('Einrichtung fehlgeschlagen.'); return false; }
+    return true;
+  } catch (e) {
+    if (e.name === 'NotAllowedError' || e.name === 'AbortError') setAuthError('Vorgang abgebrochen.');
+    else setAuthError('FaceID-Einrichtung nicht möglich.');
+    return false;
+  }
+}
+
+// Anmelden mit bereits eingerichtetem Gerät.
+async function doLogin() {
+  setAuthError('');
+  try {
+    const optRes = await postJSON('/api/auth/login/options');
+    if (!optRes.ok) throw new Error('options');
+    const optionsJSON = await optRes.json();
+    const asseResp = await SWA.startAuthentication({ optionsJSON });
+    const verRes = await postJSON('/api/auth/login/verify', { response: asseResp });
+    const j = await verRes.json().catch(() => ({}));
+    if (!verRes.ok || !j.verified) { setAuthError('Anmeldung fehlgeschlagen.'); return false; }
+    return true;
+  } catch (e) {
+    if (e.name === 'NotAllowedError' || e.name === 'AbortError') setAuthError('Vorgang abgebrochen.');
+    else setAuthError('Anmeldung nicht möglich.');
+    return false;
+  }
+}
+
+function waitForAuth(hasCredentials) {
+  const overlay = document.getElementById('auth-overlay');
+  const loginView = document.getElementById('auth-login');
+  const regView = document.getElementById('auth-register');
+  overlay.style.display = 'flex';
+  const show = (view) => {
+    loginView.style.display = view === 'login' ? 'block' : 'none';
+    regView.style.display = view === 'register' ? 'block' : 'none';
+    setAuthError('');
+  };
+  // Ohne registriertes Gerät direkt zur Einrichtung.
+  show(hasCredentials ? 'login' : 'register');
+  document.getElementById('show-register').onclick = () => show('register');
+  document.getElementById('show-login').onclick = () => show('login');
+
+  if (!SWA || !SWA.browserSupportsWebAuthn()) {
+    setAuthError('Dieser Browser unterstützt FaceID/Passkeys nicht.');
+  }
+
   return new Promise((resolve) => {
-    async function tryLogin() {
-      const pin = document.getElementById('pin-input').value.trim();
-      if (!pin) return;
-      try {
-        const res = await fetch('/api/entries', { headers: { 'Authorization': 'Bearer ' + pin } });
-        if (res.ok) {
-          sessionToken = pin;
-          sessionStorage.setItem('aperol_token', pin);
-          hideAuthOverlay();
-          resolve();
-        } else {
-          showAuthOverlay(true);
-        }
-      } catch (_e) {
-        document.getElementById('pin-error').textContent = 'Server nicht erreichbar.';
-        document.getElementById('pin-error').style.display = 'block';
-      }
-    }
-    document.getElementById('pin-submit').onclick = tryLogin;
-    document.getElementById('pin-input').onkeydown = (e) => { if (e.key === 'Enter') tryLogin(); };
+    document.getElementById('login-btn').onclick = async () => {
+      if (await doLogin()) { overlay.style.display = 'none'; resolve(); }
+    };
+    document.getElementById('register-btn').onclick = async () => {
+      if (await doRegister()) { overlay.style.display = 'none'; resolve(); }
+    };
   });
 }
 
@@ -315,6 +359,43 @@ document.getElementById('placeLink').onclick = () => {
   setDistState('loading', '📍 Jetzt das Restaurant auf der Karte antippen');
 };
 
+// ---- Aktueller Standort als Aperol-Spot ----
+// Setzt das Restaurant auf die aktuelle GPS-Position, sucht automatisch die Küste
+// und springt zur Preiseingabe. Name kommt aus dem Suchfeld oder wird abgefragt.
+const locBtn = document.getElementById('useLocation');
+locBtn.onclick = () => {
+  if (!navigator.geolocation) { setDistState('err', 'Standort wird vom Browser nicht unterstützt'); return; }
+  if (!map) { setDistState('err', 'Karte noch nicht geladen — bitte kurz warten'); return; }
+  let name = searchEl.value.trim();
+  if (!name) {
+    name = (prompt('Name für diesen Aperol-Spot (z. B. Bar-/Restaurant-Name):', '') || '').trim();
+    if (!name) return;
+    searchEl.value = name;
+  }
+  cur.name = name;
+  resultsEl.classList.remove('open');
+  placeRestaurantMode = false; manualMode = false;
+  locBtn.disabled = true;
+  setDistState('loading', '📍 Hole deinen aktuellen Standort …');
+  navigator.geolocation.getCurrentPosition((pos) => {
+    const lat = pos.coords.latitude, lng = pos.coords.longitude;
+    userLoc = { lat, lng };
+    if (youMarker) youMarker.setMap(null);
+    youMarker = new google.maps.Marker({ position: userLoc, map, icon: userIcon(), title: 'Dein Standort', zIndex: 1 });
+    setRestaurant(lat, lng);
+    cur.sea = null; cur.dist = null;
+    if (sMarker) { sMarker.setMap(null); sMarker = null; }
+    drawLine();
+    mapSetView(lat, lng, 15);
+    locBtn.disabled = false;
+    findCoast(lat, lng);
+    document.getElementById('price').focus();
+  }, () => {
+    locBtn.disabled = false;
+    setDistState('err', 'Standort nicht verfügbar — bitte Ortungsfreigabe im Browser erlauben');
+  }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
+};
+
 // ---- Validierung & Speichern ----
 document.getElementById('price').oninput = validate;
 function validate() {
@@ -402,7 +483,11 @@ function render() {
     const sd = resids.length > 1 ? Math.sqrt(resids.reduce((s, x) => s + x * x, 0) / resids.length) : 0;
     tbody.innerHTML = rows.map((r) => {
       let bw = '<span class="badge fair">—</span>';
-      if (r.resid != null && sd > 0) {
+      // Absoluter Schnäppchen-Preis schlägt alles: unter ABSOLUTE_DEAL_PRICE ist Aperol
+      // unabhängig von der Meeresentfernung günstig.
+      if (r.price <= ABSOLUTE_DEAL_PRICE) {
+        bw = '<span class="badge deal">🟢 Schnäppchen</span>';
+      } else if (r.resid != null && sd > 0) {
         if (r.resid < -0.4 * sd) bw = '<span class="badge deal">🟢 Schnäppchen</span>';
         else if (r.resid > 0.4 * sd) bw = '<span class="badge trap">🔴 Touri-Falle</span>';
         else bw = '<span class="badge fair">🟠 fair</span>';
@@ -480,16 +565,11 @@ async function init() {
     config = await cfgRes.json();
   } catch (_e) {}
 
-  // Auth
+  // Auth (FaceID). Session steckt im Cookie → Server fragen, ob schon angemeldet.
   if (config.auth) {
-    sessionToken = sessionStorage.getItem('aperol_token') || '';
-    if (sessionToken) {
-      try {
-        const test = await fetch('/api/entries', { headers: { 'Authorization': 'Bearer ' + sessionToken } });
-        if (test.status === 401) { sessionToken = ''; sessionStorage.removeItem('aperol_token'); }
-      } catch (_e) {}
-    }
-    if (!sessionToken) await waitForAuth();
+    let status = { authed: false, hasCredentials: false };
+    try { status = await (await fetch('/api/auth/status')).json(); } catch (_e) {}
+    if (!status.authed) await waitForAuth(status.hasCredentials);
   }
 
   // Google Maps
