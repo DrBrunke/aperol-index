@@ -1,30 +1,212 @@
+// ---- Auth ----
+let sessionToken = '';
+
+async function authFetch(url, options = {}) {
+  if (sessionToken) {
+    options = { ...options, headers: { ...(options.headers || {}), 'Authorization': 'Bearer ' + sessionToken } };
+  }
+  const res = await fetch(url, options);
+  if (res.status === 401) {
+    sessionToken = '';
+    sessionStorage.removeItem('aperol_token');
+    location.reload();
+    throw new Error('auth');
+  }
+  return res;
+}
+
+function showAuthOverlay(wrongPin = false) {
+  document.getElementById('auth-overlay').style.display = 'flex';
+  document.getElementById('pin-error').style.display = wrongPin ? 'block' : 'none';
+  document.getElementById('pin-input').value = '';
+  setTimeout(() => document.getElementById('pin-input').focus(), 50);
+}
+
+function hideAuthOverlay() {
+  document.getElementById('auth-overlay').style.display = 'none';
+}
+
+async function waitForAuth() {
+  showAuthOverlay();
+  return new Promise((resolve) => {
+    async function tryLogin() {
+      const pin = document.getElementById('pin-input').value.trim();
+      if (!pin) return;
+      try {
+        const res = await fetch('/api/entries', { headers: { 'Authorization': 'Bearer ' + pin } });
+        if (res.ok) {
+          sessionToken = pin;
+          sessionStorage.setItem('aperol_token', pin);
+          hideAuthOverlay();
+          resolve();
+        } else {
+          showAuthOverlay(true);
+        }
+      } catch (_e) {
+        document.getElementById('pin-error').textContent = 'Server nicht erreichbar.';
+        document.getElementById('pin-error').style.display = 'block';
+      }
+    }
+    document.getElementById('pin-submit').onclick = tryLogin;
+    document.getElementById('pin-input').onkeydown = (e) => { if (e.key === 'Enter') tryLogin(); };
+  });
+}
+
+// ---- Google Maps Loader ----
+async function loadGoogleMaps(key) {
+  if (window.google?.maps) return;
+  await new Promise((resolve, reject) => {
+    window.__googleMapsReady__ = () => { delete window.__googleMapsReady__; resolve(); };
+    const s = document.createElement('script');
+    s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&loading=async&callback=__googleMapsReady__`;
+    s.async = true;
+    s.onerror = () => reject(new Error('Google Maps konnte nicht geladen werden'));
+    document.head.appendChild(s);
+  });
+}
+
 // ---- State ----
-let data = [];                          // Einträge aus dem Backend
+let data = [];
 let sort = { k: 'idx', dir: -1 };
-let cur = { name: null, r: null, sea: null, dist: null }; // aktueller Entwurf
+let cur = { name: null, r: null, sea: null, dist: null };
 let manualMode = false, placeRestaurantMode = false;
-let userLoc = null;                     // {lat,lng} für Standort-Priorisierung
+let userLoc = null;
 
-// ---- Karte ----
-const map = L.map('map').setView([43.0, 7.0], 4);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(map);
-const orangeIcon = L.divIcon({ className: '', html: '<div style="font-size:30px;line-height:30px;transform:translate(-50%,-100%)">📍</div>', iconSize: [0, 0] });
-const seaIcon = L.divIcon({ className: '', html: '<div style="font-size:24px;line-height:24px;transform:translate(-50%,-50%)">🌊</div>', iconSize: [0, 0] });
-let rMarker = null, sMarker = null, line = null, youMarker = null;
+// ---- Map (Google Maps) ----
+let map = null;
+let rMarker = null, sMarker = null, polyline = null, youMarker = null;
 
+const COLOR_ORANGE      = '#f5631e';
+const COLOR_ORANGE_DARK = '#d94d0c';
+const COLOR_SEA         = '#1b9aaa';
+const COLOR_SEA_DARK    = '#13707b';
+
+function initMap() {
+  map = new google.maps.Map(document.getElementById('map'), {
+    center: { lat: 43.0, lng: 7.0 },
+    zoom: 4,
+    mapTypeControl: true,
+    mapTypeControlOptions: { style: google.maps.MapTypeControlStyle.DROPDOWN_MENU },
+    streetViewControl: false,
+    fullscreenControl: false,
+    gestureHandling: 'cooperative',
+  });
+
+  map.addListener('click', (event) => {
+    const lat = event.latLng.lat(), lng = event.latLng.lng();
+    if (placeRestaurantMode) {
+      placeRestaurantMode = false;
+      setRestaurant(lat, lng);
+      cur.sea = null; cur.dist = null;
+      if (sMarker) { sMarker.setMap(null); sMarker = null; }
+      drawLine();
+      findCoast(lat, lng);
+      return;
+    }
+    if (!cur.r) return;
+    if (!manualMode && cur.sea) return;
+    setSea(lat, lng);
+    cur.dist = haversine(cur.r, cur.sea);
+    drawLine(); showDist(); validate();
+  });
+}
+
+function restaurantIcon() {
+  return {
+    path: 'M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z',
+    fillColor: COLOR_ORANGE,
+    fillOpacity: 1,
+    strokeColor: COLOR_ORANGE_DARK,
+    strokeWeight: 1.5,
+    scale: 1.9,
+    anchor: new google.maps.Point(12, 22),
+  };
+}
+
+function seaIcon() {
+  return {
+    path: google.maps.SymbolPath.CIRCLE,
+    scale: 11,
+    fillColor: COLOR_SEA,
+    fillOpacity: 0.9,
+    strokeColor: COLOR_SEA_DARK,
+    strokeWeight: 2,
+  };
+}
+
+function userIcon() {
+  return {
+    path: google.maps.SymbolPath.CIRCLE,
+    scale: 8,
+    fillColor: COLOR_SEA,
+    fillOpacity: 0.7,
+    strokeColor: '#ffffff',
+    strokeWeight: 2,
+  };
+}
+
+function drawLine() {
+  if (polyline) { polyline.setMap(null); polyline = null; }
+  if (!cur.r || !cur.sea) return;
+  const dash = { path: 'M 0,-1 0,1', strokeOpacity: 1, scale: 4 };
+  polyline = new google.maps.Polyline({
+    path: [{ lat: cur.r.lat, lng: cur.r.lng }, { lat: cur.sea.lat, lng: cur.sea.lng }],
+    strokeOpacity: 0,
+    strokeColor: COLOR_SEA,
+    icons: [{ icon: dash, offset: '0', repeat: '20px' }],
+    map,
+  });
+}
+
+function setRestaurant(lat, lng) {
+  cur.r = { lat, lng };
+  if (rMarker) {
+    rMarker.setPosition({ lat, lng });
+  } else {
+    rMarker = new google.maps.Marker({ position: { lat, lng }, map, icon: restaurantIcon(), title: 'Restaurant', zIndex: 2 });
+  }
+}
+
+function setSea(lat, lng) {
+  cur.sea = { lat, lng };
+  if (sMarker) {
+    sMarker.setPosition({ lat, lng });
+  } else {
+    sMarker = new google.maps.Marker({ position: { lat, lng }, map, icon: seaIcon(), title: 'Meerpunkt', draggable: true, cursor: 'grab', zIndex: 2 });
+    sMarker.addListener('dragend', (e) => {
+      cur.sea = { lat: e.latLng.lat(), lng: e.latLng.lng() };
+      cur.dist = haversine(cur.r, cur.sea);
+      drawLine(); showDist(); validate();
+    });
+  }
+}
+
+function mapSetView(lat, lng, zoom) {
+  if (!map) return;
+  map.setCenter({ lat, lng });
+  if (zoom !== undefined) map.setZoom(zoom);
+}
+
+function mapFitBounds(lat1, lng1, lat2, lng2) {
+  if (!map) return;
+  const bounds = new google.maps.LatLngBounds();
+  bounds.extend({ lat: lat1, lng: lng1 });
+  bounds.extend({ lat: lat2, lng: lng2 });
+  map.fitBounds(bounds, { top: 60, right: 60, bottom: 60, left: 60 });
+}
+
+// ---- User Location ----
 function locateUser() {
-  if (!navigator.geolocation) return;
+  if (!navigator.geolocation || !map) return;
   navigator.geolocation.getCurrentPosition((pos) => {
     userLoc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-    if (youMarker) map.removeLayer(youMarker);
-    youMarker = L.circleMarker([userLoc.lat, userLoc.lng], { radius: 7, color: '#1b9aaa', fillColor: '#1b9aaa', fillOpacity: .7, weight: 2 })
-      .addTo(map).bindTooltip('Dein Standort');
-    if (!cur.r) map.setView([userLoc.lat, userLoc.lng], 14);
+    if (youMarker) youMarker.setMap(null);
+    youMarker = new google.maps.Marker({ position: userLoc, map, icon: userIcon(), title: 'Dein Standort', zIndex: 1 });
+    if (!cur.r) mapSetView(userLoc.lat, userLoc.lng, 14);
   }, () => {}, { enableHighAccuracy: true, timeout: 8000, maximumAge: 300000 });
 }
-locateUser();
 
-// ---- Geo-Mathe (Anzeige/Fallback im Client) ----
+// ---- Geo-Mathe (Client-Fallback) ----
 function haversine(a, b) {
   const R = 6371000, toR = (x) => x * Math.PI / 180;
   const dLat = toR(b.lat - a.lat), dLng = toR(b.lng - a.lng);
@@ -33,28 +215,11 @@ function haversine(a, b) {
 }
 function fmtDist(m) { return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m'; }
 
-// ---- Marker-Helfer ----
-function drawLine() {
-  if (line) { map.removeLayer(line); line = null; }
-  if (cur.r && cur.sea) line = L.polyline([[cur.r.lat, cur.r.lng], [cur.sea.lat, cur.sea.lng]], { color: '#1b9aaa', weight: 3, dashArray: '6 6' }).addTo(map);
-}
-function setRestaurant(lat, lng) {
-  cur.r = { lat, lng };
-  if (rMarker) rMarker.setLatLng([lat, lng]); else rMarker = L.marker([lat, lng], { icon: orangeIcon }).addTo(map);
-}
-function setSea(lat, lng) {
-  cur.sea = { lat, lng };
-  if (sMarker) sMarker.setLatLng([lat, lng]);
-  else {
-    sMarker = L.marker([lat, lng], { icon: seaIcon, draggable: true }).addTo(map);
-    sMarker.on('dragend', () => { const p = sMarker.getLatLng(); cur.sea = { lat: p.lat, lng: p.lng }; cur.dist = haversine(cur.r, cur.sea); drawLine(); showDist(); validate(); });
-  }
-}
-
-// ---- Suche (über Backend-Proxy) ----
+// ---- Suche ----
 const searchEl = document.getElementById('search');
 const resultsEl = document.getElementById('results');
 let searchTimer = null, hlIdx = -1, lastResults = [];
+
 searchEl.addEventListener('input', () => {
   cur.name = null; validate();
   clearTimeout(searchTimer);
@@ -78,7 +243,7 @@ async function doSearch(q) {
   try {
     let url = '/api/search?q=' + encodeURIComponent(q);
     if (userLoc) url += '&lat=' + userLoc.lat + '&lng=' + userLoc.lng;
-    const res = await fetch(url);
+    const res = await authFetch(url);
     if (!res.ok) throw new Error('search ' + res.status);
     const results = await res.json();
     lastResults = results; hlIdx = -1;
@@ -86,39 +251,43 @@ async function doSearch(q) {
     resultsEl.innerHTML = results.map((r) => `<div class="res"><b>${esc(r.title)}</b><div class="sub">${esc(r.sub || '')}</div></div>`).join('');
     resultsEl.classList.add('open');
     [...resultsEl.querySelectorAll('.res')].forEach((el, i) => el.onclick = () => chooseResult(results[i]));
-  } catch (e) { showResultsInfo('Suche nicht erreichbar'); }
+  } catch (e) {
+    if (e.message !== 'auth') showResultsInfo('Suche nicht erreichbar');
+  }
 }
+
 function chooseResult(r) {
   cur.name = r.title; searchEl.value = r.title;
   resultsEl.classList.remove('open');
   setRestaurant(r.lat, r.lng);
   cur.sea = null; cur.dist = null;
-  if (sMarker) { map.removeLayer(sMarker); sMarker = null; }
+  if (sMarker) { sMarker.setMap(null); sMarker = null; }
   drawLine();
-  map.setView([r.lat, r.lng], 14);
-  setTimeout(() => map.invalidateSize(), 100);
+  mapSetView(r.lat, r.lng, 14);
   findCoast(r.lat, r.lng);
 }
 
-// ---- Küstenlinie / Luftlinie (über Backend) ----
+// ---- Küstenlinie ----
 async function findCoast(lat, lng) {
   setDistState('loading', '🌊 Suche nächste Küstenlinie …');
   document.getElementById('manual').style.display = 'none';
   manualMode = false;
   try {
-    const res = await fetch('/api/coast?lat=' + lat + '&lng=' + lng);
+    const res = await authFetch('/api/coast?lat=' + lat + '&lng=' + lng);
     if (!res.ok) throw new Error('coast ' + res.status);
-    const best = await res.json(); // {lat,lng,dist}
+    const best = await res.json();
     setSea(best.lat, best.lng);
     cur.dist = best.dist;
     drawLine();
-    map.fitBounds(L.latLngBounds([[cur.r.lat, cur.r.lng], [cur.sea.lat, cur.sea.lng]]).pad(0.4));
+    mapFitBounds(cur.r.lat, cur.r.lng, cur.sea.lat, cur.sea.lng);
     showDist();
     document.getElementById('manual').style.display = 'block';
     validate();
   } catch (e) {
-    setDistState('err', 'Küste nicht automatisch gefunden — bitte manuell setzen');
-    enableManual(true);
+    if (e.message !== 'auth') {
+      setDistState('err', 'Küste nicht automatisch gefunden — bitte manuell setzen');
+      enableManual(true);
+    }
   }
 }
 
@@ -126,7 +295,7 @@ function setDistState(cls, t) { const el = document.getElementById('dist'); el.c
 function showDist() { setDistState('', 'Luftlinie zum Meer: ' + fmtDist(cur.dist)); }
 
 // ---- Manuelle Punkte ----
-document.getElementById('manualLink').onclick = () => enableManual(true, true);
+document.getElementById('manualLink').onclick = () => enableManual(true);
 function enableManual(on) {
   manualMode = on;
   document.getElementById('manual').style.display = 'block';
@@ -140,67 +309,57 @@ document.getElementById('placeLink').onclick = () => {
   resultsEl.classList.remove('open');
   setDistState('loading', '📍 Jetzt das Restaurant auf der Karte antippen');
 };
-map.on('click', (e) => {
-  if (placeRestaurantMode) {
-    placeRestaurantMode = false;
-    setRestaurant(e.latlng.lat, e.latlng.lng);
-    cur.sea = null; cur.dist = null;
-    if (sMarker) { map.removeLayer(sMarker); sMarker = null; }
-    drawLine();
-    findCoast(e.latlng.lat, e.latlng.lng);
-    return;
-  }
-  if (!cur.r) return;
-  if (!manualMode && cur.sea) return;
-  setSea(e.latlng.lat, e.latlng.lng);
-  cur.dist = haversine(cur.r, cur.sea); drawLine(); showDist(); validate();
-});
 
-// ---- Validierung & Speichern (Backend) ----
+// ---- Validierung & Speichern ----
 document.getElementById('price').oninput = validate;
 function validate() {
-  const ok = cur.name && cur.r && cur.sea && cur.dist != null && parseFloat(document.getElementById('price').value) > 0;
+  const price = parseFloat(document.getElementById('price').value);
+  const ok = cur.name && cur.r && cur.sea && cur.dist != null && cur.dist > 0 && price > 0;
   document.getElementById('add').disabled = !ok;
 }
+
 document.getElementById('add').onclick = async () => {
   const btn = document.getElementById('add'); btn.disabled = true;
   const payload = { name: cur.name, price: parseFloat(document.getElementById('price').value), dist: cur.dist, r: cur.r, s: cur.sea };
   try {
-    const res = await fetch('/api/entries', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const res = await authFetch('/api/entries', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     if (!res.ok) throw new Error('save ' + res.status);
-    // reset
     cur = { name: null, r: null, sea: null, dist: null }; manualMode = false;
     searchEl.value = ''; document.getElementById('price').value = '';
-    if (rMarker) { map.removeLayer(rMarker); rMarker = null; }
-    if (sMarker) { map.removeLayer(sMarker); sMarker = null; }
-    if (line) { map.removeLayer(line); line = null; }
+    if (rMarker) { rMarker.setMap(null); rMarker = null; }
+    if (sMarker) { sMarker.setMap(null); sMarker = null; }
+    if (polyline) { polyline.setMap(null); polyline = null; }
     setDistState('', 'Noch kein Ort gewählt');
     document.getElementById('manual').style.display = 'none';
     await loadEntries();
   } catch (e) {
-    setStatus('Speichern fehlgeschlagen – Server erreichbar?', true);
-    btn.disabled = false;
+    if (e.message !== 'auth') { setStatus('Speichern fehlgeschlagen – Server erreichbar?', true); btn.disabled = false; }
   }
 };
 
+// ---- Einträge laden / löschen ----
 async function loadEntries() {
   try {
-    const res = await fetch('/api/entries');
+    const res = await authFetch('/api/entries');
     if (!res.ok) throw new Error('load ' + res.status);
     data = await res.json();
-    setStatus('');
-    render();
+    setStatus(''); render();
   } catch (e) {
-    setStatus('Liste konnte nicht geladen werden – läuft das Backend?', true);
+    if (e.message !== 'auth') setStatus('Liste konnte nicht geladen werden – läuft das Backend?', true);
   }
 }
+
 async function delEntry(id) {
+  if (!confirm('Eintrag wirklich löschen?')) return;
   try {
-    const res = await fetch('/api/entries/' + id, { method: 'DELETE' });
+    const res = await authFetch('/api/entries/' + id, { method: 'DELETE' });
     if (!res.ok && res.status !== 404) throw new Error('del ' + res.status);
     await loadEntries();
-  } catch (e) { setStatus('Löschen fehlgeschlagen', true); }
+  } catch (e) {
+    if (e.message !== 'auth') setStatus('Löschen fehlgeschlagen', true);
+  }
 }
+
 function setStatus(t, err) { const el = document.getElementById('status'); el.textContent = t; el.className = 'status' + (err ? ' err' : ''); }
 
 // ---- Trend ----
@@ -222,8 +381,8 @@ function render() {
   const tbody = document.getElementById('tbody');
   const reg = regression();
   const rows = data.map((d) => {
-    const idx = d.price / d.dist * 100;
-    let resid = null; if (reg) resid = d.price - (reg.m * d.dist + reg.b);
+    const idx = d.dist > 0 ? d.price / d.dist * 100 : 0;
+    const resid = reg ? d.price - (reg.m * d.dist + reg.b) : null;
     return { ...d, idx, resid };
   });
   rows.sort((a, b) => {
@@ -251,35 +410,45 @@ function render() {
   }
   renderStats(reg); renderChart(reg);
 }
+
 function renderStats(reg) {
   const el = document.getElementById('stats');
   if (data.length === 0) { el.innerHTML = ''; return; }
   const prices = data.map((d) => d.price);
   const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
   const min = Math.min(...prices), max = Math.max(...prices);
-  const cheap = data.find((d) => d.price === min).name;
+  const cheap     = data.find((d) => d.price === min);
+  const expensive = data.find((d) => d.price === max);
   el.innerHTML = `
     <div class="stat"><div class="v">${data.length}</div><div class="l">Spots</div></div>
     <div class="stat"><div class="v">${avg.toFixed(2)} €</div><div class="l">Ø Preis</div></div>
-    <div class="stat"><div class="v">${min.toFixed(2)} €</div><div class="l">günstigster<br>(${esc(cheap)})</div></div>
-    <div class="stat"><div class="v">${max.toFixed(2)} €</div><div class="l">teuerster</div></div>`;
+    <div class="stat"><div class="v">${min.toFixed(2)} €</div><div class="l">günstigster<br>(${esc(cheap.name)})</div></div>
+    <div class="stat"><div class="v">${max.toFixed(2)} €</div><div class="l">teuerster<br>(${esc(expensive.name)})</div></div>`;
   const ti = document.getElementById('trendinfo');
-  if (reg) { const t = reg.r < -0.2 ? 'näher = teurer' : reg.r > 0.2 ? 'näher = billiger?!' : 'kein klarer Zusammenhang';
-    ti.innerHTML = `Trend: <b>${t}</b> (Korrelation r = ${reg.r.toFixed(2)}). Pro 100 m weiter vom Meer ≈ ${(reg.m * 100).toFixed(2)} € Preisänderung.`; }
+  if (reg) {
+    const t = reg.r < -0.2 ? 'näher = teurer' : reg.r > 0.2 ? 'näher = billiger?!' : 'kein klarer Zusammenhang';
+    ti.innerHTML = `Trend: <b>${t}</b> (Korrelation r = ${reg.r.toFixed(2)}). Pro 100 m weiter vom Meer ≈ ${(reg.m * 100).toFixed(2)} € Preisänderung.`;
+  }
 }
+
 function renderChart(reg) {
   const ctx = document.getElementById('chart');
   const pts = data.map((d) => ({ x: d.dist, y: d.price, name: d.name }));
-  const datasets = [{ label: 'Bars', data: pts, backgroundColor: '#f5631e', pointRadius: 7, pointHoverRadius: 9 }];
+  const datasets = [{ label: 'Bars', data: pts, backgroundColor: COLOR_ORANGE, pointRadius: 7, pointHoverRadius: 9 }];
   if (reg && data.length >= 2) {
     const xs = data.map((d) => d.dist); const x0 = Math.min(...xs), x1 = Math.max(...xs);
-    datasets.push({ label: 'Trend', type: 'line', data: [{ x: x0, y: reg.m * x0 + reg.b }, { x: x1, y: reg.m * x1 + reg.b }], borderColor: '#1b9aaa', borderDash: [6, 6], pointRadius: 0, borderWidth: 2, fill: false });
+    datasets.push({ label: 'Trend', type: 'line', data: [{ x: x0, y: reg.m * x0 + reg.b }, { x: x1, y: reg.m * x1 + reg.b }], borderColor: COLOR_SEA, borderDash: [6, 6], pointRadius: 0, borderWidth: 2, fill: false });
   }
-  if (chart) chart.destroy();
-  chart = new Chart(ctx, { type: 'scatter', data: { datasets }, options: { responsive: true,
-    plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => { const p = c.raw; return (p.name ? p.name + ': ' : '') + p.y.toFixed(2) + ' € @ ' + fmtDist(p.x); } } } },
-    scales: { x: { title: { display: true, text: 'Luftlinie zum Meer (m)' }, beginAtZero: true }, y: { title: { display: true, text: 'Aperol-Preis (€)' }, beginAtZero: true } } } });
+  if (chart) {
+    chart.data.datasets = datasets;
+    chart.update('none');
+  } else {
+    chart = new Chart(ctx, { type: 'scatter', data: { datasets }, options: { responsive: true,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => { const p = c.raw; return (p.name ? p.name + ': ' : '') + p.y.toFixed(2) + ' € @ ' + fmtDist(p.x); } } } },
+      scales: { x: { title: { display: true, text: 'Luftlinie zum Meer (m)' }, beginAtZero: true }, y: { title: { display: true, text: 'Aperol-Preis (€)' }, beginAtZero: true } } } });
+  }
 }
+
 function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
 // ---- Sort / Toolbar ----
@@ -289,13 +458,46 @@ document.querySelectorAll('#tbl th[data-k]').forEach((th) => {
 document.getElementById('reload').onclick = loadEntries;
 document.getElementById('csv').onclick = () => {
   if (!data.length) return;
-  let csv = 'Ort;Preis_EUR;Distanz_m;EUR_pro_100m;Rest_Lat;Rest_Lng;Meer_Lat;Meer_Lng\n';
+  const bom = '﻿';
+  let csv = bom + 'Ort;Preis_EUR;Distanz_m;EUR_pro_100m;Rest_Lat;Rest_Lng;Meer_Lat;Meer_Lng\n';
   data.forEach((d) => { csv += [d.name, d.price.toFixed(2), Math.round(d.dist), (d.price / d.dist * 100).toFixed(2),
     d.r.lat.toFixed(6), d.r.lng.toFixed(6), d.s.lat.toFixed(6), d.s.lng.toFixed(6)].join(';') + '\n'; });
-  const blob = new Blob([csv], { type: 'text/csv' }); const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob); a.download = 'aperol-index.csv'; a.click();
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'aperol-index.csv'; a.click();
 };
 
 // ---- Init ----
-loadEntries();
-setTimeout(() => map.invalidateSize(), 200);
+async function init() {
+  let config = { auth: false, mapsKey: '' };
+  try { config = await fetch('/api/config').then(r => r.json()); } catch (_e) {}
+
+  // Auth
+  if (config.auth) {
+    sessionToken = sessionStorage.getItem('aperol_token') || '';
+    if (sessionToken) {
+      try {
+        const test = await fetch('/api/entries', { headers: { 'Authorization': 'Bearer ' + sessionToken } });
+        if (test.status === 401) { sessionToken = ''; sessionStorage.removeItem('aperol_token'); }
+      } catch (_e) {}
+    }
+    if (!sessionToken) await waitForAuth();
+  }
+
+  // Google Maps
+  const mapDiv = document.getElementById('map');
+  if (config.mapsKey) {
+    try {
+      await loadGoogleMaps(config.mapsKey);
+      initMap();
+    } catch (_e) {
+      mapDiv.innerHTML = '<p class="map-loading" style="color:#c4392c;">Google Maps konnte nicht geladen werden.</p>';
+    }
+  } else {
+    mapDiv.innerHTML = '<p class="map-loading">🗺️ Kein Key gesetzt — <code>GOOGLE_MAPS_KEY</code> in <code>.env</code> eintragen.</p>';
+  }
+
+  await loadEntries();
+  locateUser();
+}
+
+init();

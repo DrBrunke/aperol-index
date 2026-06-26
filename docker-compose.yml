@@ -10,7 +10,9 @@ services:
     environment:
       - PORT=3000
       - DB_PATH=/app/data/aperol.db
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}   # optional: aus .env geladen; leer = OSM-Suche
+      - AUTH_TOKEN=${AUTH_TOKEN:-}
+      - GOOGLE_MAPS_KEY=${GOOGLE_MAPS_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
     env_file:
       - path: .env
         required: false
